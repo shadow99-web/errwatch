@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "errwatch"
-version = "1.0.0"
+version = "1.1.0"
 description = "Drop-in self-debugging error reporter for Discord bots and Python scripts"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -33,10 +33,11 @@ dependencies = [
 
 [project.optional-dependencies]
 discord = ["discord.py>=2.0.0"]
+metrics = ["psutil>=5.9.0"]
 
 [project.urls]
-Homepage = "https://github.com/shadow99-web/errwatch"
-Issues   = "https://github.com/shadow99-web/errwatch/issues"
+Homepage = "https://github.com/YOUR_USERNAME/errwatch"
+Issues   = "https://github.com/YOUR_USERNAME/errwatch/issues"
 
 [tool.setuptools]
 py-modules = ["errwatch"]
