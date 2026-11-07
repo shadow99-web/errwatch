@@ -36,8 +36,8 @@ discord = ["discord.py>=2.0.0"]
 metrics = ["psutil>=5.9.0"]
 
 [project.urls]
-Homepage = "https://github.com/YOUR_USERNAME/errwatch"
-Issues   = "https://github.com/YOUR_USERNAME/errwatch/issues"
+Homepage = "https://github.com/shadow99-web/errwatch"
+Issues   = "https://github.com/shadow99-web/errwatch/issues"
 
 [tool.setuptools]
 py-modules = ["errwatch"]
