@@ -9,25 +9,25 @@ Catches exceptions, formats full tracebacks, sends them to a Discord webhook or 
 ### In a Discord bot project
 
 ```bash
-pip install "git+https://github.com/YOUR_USERNAME/errwatch.git@v1.0.0"
+pip install "git+https://github.com/shadow99-web/errwatch.git@v1.0.0"
 ```
 
 Or in `requirements.txt`:
 
 ```
-git+https://github.com/YOUR_USERNAME/errwatch.git@v1.0.0
+git+https://github.com/shadow99-web/errwatch.git@v1.0.0
 ```
 
 ### With Discord support (attach() and DM delivery)
 
 ```bash
-pip install "errwatch[discord] @ git+https://github.com/YOUR_USERNAME/errwatch.git@v1.0.0"
+pip install "errwatch[discord] @ git+https://github.com/shadow99-web/errwatch.git@v1.0.0"
 ```
 
 Or if you already have `discord.py` / `discord.py-self` installed:
 
 ```bash
-pip install "git+https://github.com/YOUR_USERNAME/errwatch.git@v1.0.0"
+pip install "git+https://github.com/shadow99-web/errwatch.git@v1.0.0"
 ```
 
 `discord` is auto-detected at runtime — `attach()` requires it, but `report()` works in any script.
