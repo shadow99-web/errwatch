@@ -257,3 +257,87 @@ async def _async_main():
     finally:
         await watcher.shutdown()
 ```
+
+## What's new in v1.2.0
+
+All features from v1.1.0 plus:
+
+- **Smart traceback filtering** — `site-packages/` frames collapsed to `[... N library frames hidden ...]`, your code highlighted
+- **Breadcrumbs** — `watcher.breadcrumb("event", key=val)` records events leading up to the error
+- **Config snapshot** — `config_provider=lambda: {...}` includes current config in every report
+- **Regression detection** — `[NEW]` tag on first occurrence of each fingerprint
+- **Command coalescing** — reports show all commands that hit the same error
+- **Per-command stats** — total + hourly count per command
+- **Recovery suggestions** — common error types map to suggested fixes
+- **Sampling** — `sample_rate=0.1` reports 1 in 10 (noisy bot protection)
+- **Test mode** — `test_mode=True` logs only, no webhook (for local dev)
+
+### Full config example
+
+```python
+from errwatch import ErrorWatcher
+
+watcher = ErrorWatcher(
+    webhook_url=os.environ["ERRWATCH_WEBHOOK"],
+    owner_id=int(os.environ.get("ERRWATCH_OWNER_ID", "0")),
+    bot_name="imgban",
+    project_dirs=["/opt/render/project/src"],       # hide libs, highlight your code
+    config_provider=lambda: {                        # included in every report
+        "prefix":  PREFIX,
+        "db_path": DB_PATH,
+        "devs":    len(DEV_IDS),
+        "hf":      HF_TOKEN is not None,
+    },
+    ignore=[
+        "discord.errors.Forbidden",
+        "discord.errors.NotFound",
+        "asyncio.CancelledError",
+    ],
+    ignore_patterns=["*unknown message*", "*50035*"],
+    mute_after_hourly=100,
+    breadcrumb_max=30,
+    show_suggestions=True,
+    show_env=True,
+    show_stats=True,
+)
+watcher.attach(bot)
+watcher.install_excepthook()
+```
+
+### Breadcrumbs in action
+
+```python
+@bot.command(name="devfq")
+async def devfq(ctx, action: str, user: discord.User):
+    watcher.breadcrumb("command_start", command="devfq", action=action, user=user.id)
+    try:
+        watcher.breadcrumb("db_call", method="add_dev_friend", user=user.id)
+        await bot.db.add_dev_friend(user.id, ctx.author.id)
+        watcher.breadcrumb("success", command="devfq", user=user.id)
+    except Exception:
+        # error report will show all breadcrumbs leading up to this
+        raise
+```
+
+### Test mode for local dev
+
+```python
+watcher = ErrorWatcher(
+    webhook_url="",              # don't spam Discord
+    test_mode=True,              # log only
+    bot_name="imgban",
+)
+```
+
+Every "reported" error appears in `errwatch.log` and prints to console — but doesn't hit Discord. Flip `test_mode=False` for production.
+
+### Sampling for noisy bots
+
+```python
+watcher = ErrorWatcher(
+    webhook_url="...",
+    sample_rate=0.1,             # report 1 in 10 errors
+)
+```
+
+Useful when a single bug floods your channel. Set `sample_rate=1.0` (default) to disable.
