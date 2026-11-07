@@ -197,3 +197,63 @@ If you find a security issue, please open an issue (or DM the maintainer for sen
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+## What's new in v1.1.0
+
+- **Environment snapshot** — every report includes Python version, OS, discord.py version, uptime, memory
+- **Smart dedup with auto-mute** — errors firing >100x/hr auto-mute for 24h (configurable)
+- **Exception filters** — `ignore=["discord.errors.NotFound"]` skips expected errors entirely
+- **Pattern filters** — `ignore_patterns=["*unknown message*"]` for message-matching
+- **Non-async excepthook** — `watcher.install_excepthook()` catches sync crashes
+- **Sync reporting** — `watcher.report_sync(exc)` from non-async code
+- **Shutdown flush** — `await watcher.shutdown()` waits for in-flight webhook posts
+- **Expanded severity** — `"info"` / `"warning"` / `"error"` / `"critical"` with distinct emoji + colors
+- **Suppress context manager** — `async with watcher.suppress(discord.NotFound):`
+
+### New usage examples
+
+```python
+from errwatch import ErrorWatcher
+
+watcher = ErrorWatcher(
+    webhook_url="...",
+    bot_name="starboard",
+    ignore=[
+        "discord.errors.Forbidden",
+        "discord.errors.NotFound",
+        "asyncio.CancelledError",
+    ],
+    ignore_patterns=["*unknown message*"],
+    mute_after_hourly=100,
+    mute_duration_seconds=86400,
+)
+watcher.attach(bot)
+watcher.install_excepthook()
+```
+
+Suppress expected failures in-place:
+
+```python
+async with watcher.suppress(discord.NotFound, report=True):
+    await msg.edit(embed=embed)
+```
+
+Report from sync code:
+
+```python
+try:
+    config = load_config("config.json")
+except FileNotFoundError as e:
+    watcher.report_sync(e, context={"script": "startup"})
+    raise
+```
+
+Flush on shutdown:
+
+```python
+async def _async_main():
+    try:
+        await bot.start(TOKEN)
+    finally:
+        await watcher.shutdown()
+```
