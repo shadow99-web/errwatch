@@ -341,3 +341,106 @@ watcher = ErrorWatcher(
 ```
 
 Useful when a single bug floods your channel. Set `sample_rate=1.0` (default) to disable.
+## What's new in v1.3.0
+
+Universal auto-breadcrumbs. No per-command code — every command in every bot type gets tracked automatically.
+
+- **`attach(bot)`** — full setup (commands + events + errors)
+- **`attach_breadcrumbs_only(bot)`** — breadcrumbs only, non-invasive (for bots with custom `on_command_error`)
+- **`attach_tree(tree)`** — slash command tracking (auto-called from `attach` if bot has `.tree`)
+- **`track_task(name)`** decorator — wraps `tasks.loop` or any async function
+- **`track(name, **ctx)`** — context manager for arbitrary async blocks
+- **`track_events(bot, ...)`** — add tracking to specific Discord events at runtime
+- **Log rotation** — `log_max_bytes` + `log_backup_count`
+
+### Configuration
+
+```python
+watcher = ErrorWatcher(
+    webhook_url=...,
+    bot_name="imgban",
+    project_dirs=["/opt/render/project/src"],
+
+    # v1.3.0
+    auto_breadcrumbs=True,           # enable universal breadcrumbs
+    silent_commands={"ping", "info"},# exclude noisy commands
+    breadcrumb_include_args=True,    # add command args to breadcrumbs
+    auto_events=True,                # track default events (guild/member join/leave)
+    extra_events={"on_message"},     # additional events (use sparingly — noisy)
+    log_max_bytes=10_000_000,        # rotate at 10 MB
+    log_backup_count=3,              # keep 3 old files
+)
+```
+
+### For bots with custom `on_command_error` (like imgban)
+
+```python
+watcher = ErrorWatcher(...)
+watcher.install_excepthook()
+
+bot = ImgBanBot()
+watcher.attach_breadcrumbs_only(bot)   # ← only this, don't use attach()
+
+# bot's own @bot.event on_command_error stays untouched
+# bot calls watcher.report(error, ...) explicitly in its handler
+```
+
+### For `commands.Bot` without custom handler
+
+```python
+watcher = ErrorWatcher(...)
+watcher.attach(bot)   # handles everything
+```
+
+### For self-bots (`discord.Client`, no commands framework)
+
+```python
+watcher = ErrorWatcher(
+    ...,
+    extra_events={"on_message", "on_message_edit"},
+)
+watcher.attach(client)   # hooks on_error + events only (no commands to hook)
+```
+
+### Task loops
+
+```python
+@tasks.loop(minutes=5)
+@watcher.track_task("cycle_status")
+async def cycle_status():
+    ...
+```
+
+Works in either decorator order.
+
+### Arbitrary async blocks
+
+```python
+async with watcher.track("scan_message", msg_id=message.id, guild=message.guild.id):
+    await self.scan_message(message)
+```
+
+### Add events at runtime
+
+```python
+watcher.track_events(bot, "on_message", "on_reaction_add")
+```
+
+### What the next error report looks like
+
+```
+🐛 [NEW] TypeError
+Traceback (most recent call last):
+  [... 1 library frame(s) hidden ...]
+  File "whitelist.py", line 45, in wl_add
+    success = await self.bot.db.add_whitelist(ctx.guild.id, user.id, ctx.author.id, bypass)
+TypeError: Database.add_whitelist() takes 4 positional arguments but 5 were given
+
+Environment:  Py 3.14.8 · Linux · discord 2.7.1 · up 9h42m · 155MB
+Command stats: total 1 · last hour 1
+💡 Suggested fix: Wrong argument type or count...
+
+🍞 Breadcrumbs:
+  05:11:50 · command_start · cmd=wl add  arg.user=Member(x, 1433133814192017548)  arg.bypass=False  guild_id=...  user_id=...
+  05:11:50 · command_error · cmd=wl add  error=TypeError  runtime_ms=42
+```
