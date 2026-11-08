@@ -9,35 +9,7 @@ v1.3.0 — adds:
   · track() context manager — breadcrumbs for arbitrary async blocks
   · track_events() — add tracking to specific Discord events at runtime
   · Log rotation (log_max_bytes + log_backup_count)
-  · All v1.2.0 features retained
-
-Universal usage:
-    watcher = ErrorWatcher(webhook_url=..., bot_name="mybot")
-
-    # commands.Bot — full auto (commands + events + errors)
-    watcher.attach(bot)
-
-    # commands.Bot with custom on_command_error — breadcrumbs only
-    watcher.attach_breadcrumbs_only(bot)
-
-    # discord.Client (self-bot) — events + errors only
-    watcher.attach(client)
-
-    # add on_message tracking later
-    watcher.track_events(bot, "on_message", "on_reaction_add")
-
-    # tasks.loop
-    @tasks.loop(minutes=5)
-    @watcher.track_task("cycle_status")
-    async def cycle_status(): ...
-
-    # arbitrary async block
-    async with watcher.track("scan_message", msg_id=message.id):
-        await self.scan_message(message)
-
-    # plain script
-    watcher.install_excepthook()
-    watcher.breadcrumb("startup", argv=sys.argv)
+  · Text-symbol based emojis (fully customizable)
 """
 
 from __future__ import annotations
@@ -77,11 +49,22 @@ _SEV_COLOR = {
     "error":    0xED4245,
     "critical": 0xFF0000,
 }
-_SEV_EMOJI = {
-    "info":     "ℹ️",
-    "warning":  "⚠️",
-    "error":    "🐛",
-    "critical": "🚨",
+
+# Your requested character set
+_EMOJI_DEFAULTS: dict[str, str] = {
+    "error":       "✕",     # Heavy multiplication X
+    "warning":     "▲",     # Up-pointing triangle
+    "critical":    "☠",     # Skull and crossbones
+    "info":        "ⓘ",     # Circled I
+    "fix":         "⚒",     # Hammer and pick
+    "bread":       "↳",     # Downwards arrow with tip rightwards
+    "muted":       "⊘",     # Circled division slash
+    "new":         "✦",     # Black four pointed star
+    "env":         "⌂",     # House
+    "config":      "☰",     # Trigram for heaven
+    "stats":       "▦",     # Square with orthogonal crosshatch fill
+    "commands":    "⌘",     # Place of interest sign
+    "reply_error": "✘",     # Heavy ballot X
 }
 
 _RECOVERY_SUGGESTIONS: dict[str, str] = {
@@ -103,7 +86,6 @@ _RECOVERY_SUGGESTIONS: dict[str, str] = {
     "aiosqlite.Error": "SQLite error via aiosqlite. Check SQL syntax and connection state.",
 }
 
-# Events tracked by default when `auto_events=True`
 _DEFAULT_EVENTS = [
     "on_guild_join",
     "on_guild_remove",
@@ -195,7 +177,6 @@ class ErrorWatcher:
         ignore_patterns: Optional[list] = None,
         mute_after_hourly: int = 100,
         mute_duration_seconds: int = 86400,
-        # v1.2.0
         project_dirs: Optional[list] = None,
         config_provider: Optional[Callable[[], dict]] = None,
         test_mode: bool = False,
@@ -205,7 +186,6 @@ class ErrorWatcher:
         show_suggestions: bool = True,
         show_env: bool = True,
         show_stats: bool = True,
-        # v1.3.0
         auto_breadcrumbs: bool = True,
         silent_commands: Optional[set] = None,
         breadcrumb_include_args: bool = True,
@@ -214,6 +194,8 @@ class ErrorWatcher:
         extra_events: Optional[set] = None,
         log_max_bytes: int = 0,
         log_backup_count: int = 3,
+        use_emojis: bool = True,
+        emojis: Optional[dict] = None,
     ):
         self.webhook_url        = (webhook_url or "").strip()
         self.collector_url      = (collector_url or "").strip().rstrip("/")
@@ -228,7 +210,6 @@ class ErrorWatcher:
         self.mute_after_hourly  = mute_after_hourly
         self.mute_duration      = mute_duration_seconds
 
-        # v1.2.0
         self.project_dirs       = list(project_dirs) if project_dirs else None
         self.config_provider    = config_provider
         self.test_mode          = bool(test_mode)
@@ -245,7 +226,6 @@ class ErrorWatcher:
         self._max_fingerprints: int = 5000
         self._command_stats: dict[str, dict] = {}
 
-        # v1.3.0
         self.auto_breadcrumbs   = bool(auto_breadcrumbs)
         self.silent_commands    = set(silent_commands or [])
         self.breadcrumb_include_args = breadcrumb_include_args
@@ -254,12 +234,14 @@ class ErrorWatcher:
         self.extra_events       = set(extra_events or [])
         self.log_max_bytes      = int(log_max_bytes)
         self.log_backup_count   = int(log_backup_count)
+        self.use_emojis         = bool(use_emojis)
+        self.emojis             = dict(emojis or {})
+        
         self._command_timings: dict[int, float] = {}
         self._hooked_events: set = set()
         self._hooked_bots: set = set()
         self._hooked_trees: set = set()
 
-        # Runtime
         self._start_time        = time.time()
         self._bot: Optional[Any] = None
         self._session: Optional[aiohttp.ClientSession] = None
@@ -268,28 +250,16 @@ class ErrorWatcher:
         self._hourly: dict[str, dict] = {}
         self._recent_sends      = deque(maxlen=200)
 
-    # ─── PUBLIC: BREADCRUMBS ───────────────────────────────────
-
     def breadcrumb(self, event: str, **data):
-        """Record an event. Sync method — call from anywhere."""
         self._breadcrumbs.add(event, data)
 
     def clear_breadcrumbs(self):
         self._breadcrumbs.clear()
 
-    # ─── ATTACH: FULL ─────────────────────────────────────────
-
     def attach(self, bot):
-        """Attach all hooks: on_command_error + on_error + breadcrumbs.
-        Overwrites any existing on_command_error and on_error handlers.
-        For commands.Bot: hooks prefix commands, slash commands (if .tree), events.
-        For discord.Client: hooks on_error + events only.
-        """
         if not _DISCORD_OK:
             raise RuntimeError("discord.py or discord.py-self is required for attach()")
-
         if id(bot) in self._hooked_bots:
-            print(f"[ERRWATCH] bot already attached, skipping")
             return
         self._hooked_bots.add(id(bot))
         self._bot = bot
@@ -298,7 +268,6 @@ class ErrorWatcher:
         except Exception:
             pass
 
-        # on_error — works for both Client and Bot
         @bot.event
         async def on_error(event_name, *args, **kwargs):
             exc = sys.exc_info()[1]
@@ -308,51 +277,33 @@ class ErrorWatcher:
                 self.breadcrumb(f"event_error:{event_name}", error=type(exc).__name__)
             await self.report(exc, context={"kind": "event", "event": str(event_name)})
 
-        # on_command_error — only if it's a commands.Bot
         if hasattr(bot, "on_command_error") and hasattr(bot, "on_command"):
             @bot.event
             async def on_command_error(ctx, error):
                 await self._handle_command_error(ctx, error)
 
-        # Breadcrumbs (command hooks, slash tree, events)
         self.attach_breadcrumbs_only(bot)
-
         print(f"[ERRWATCH] attached to {self.bot_name}")
 
-    # ─── ATTACH: BREADCRUMBS ONLY (non-invasive) ──────────────
-
     def attach_breadcrumbs_only(self, bot):
-        """Attach only auto-breadcrumb listeners. Does not touch on_command_error
-        or on_error — safe for bots with custom error handling (e.g. imgban).
-        """
         if not _DISCORD_OK:
             return
-
-        # Command breadcrumbs (only for commands.Bot)
         if hasattr(bot, "on_command") and hasattr(bot, "add_listener"):
             if self.auto_breadcrumbs:
                 try:
                     bot.add_listener(self._on_command, "on_command")
                     bot.add_listener(self._on_command_completion, "on_command_completion")
-                except Exception as e:
-                    print(f"[ERRWATCH] command listeners failed: {e}")
-
-        # Slash command tree
+                except Exception:
+                    pass
         tree = getattr(bot, "tree", None)
         if tree is not None:
             self.attach_tree(tree)
-
-        # Events
         self._attach_events(bot)
 
-    # ─── ATTACH: SLASH COMMAND TREE ───────────────────────────
-
     def attach_tree(self, tree):
-        """Hook slash command errors. Preserves any existing tree.on_error."""
         if id(tree) in self._hooked_trees:
             return
         self._hooked_trees.add(id(tree))
-
         original_error = tree.on_error
         watcher = self
 
@@ -372,12 +323,10 @@ class ErrorWatcher:
                 pass
             try:
                 await original_error(interaction, error)
-            except Exception as e:
-                print(f"[ERRWATCH] original tree error handler failed: {e}")
-
+            except Exception:
+                pass
         tree.on_error = wrapped_error
 
-        # Also add breadcrumb on slash command invocation via on_interaction
         async def on_interaction(interaction):
             try:
                 if interaction.type.name != "application_command":
@@ -391,19 +340,13 @@ class ErrorWatcher:
                 if self.breadcrumb_include_args:
                     ns = getattr(interaction, "namespace", None)
                     if ns is not None:
-                        try:
-                            for k in dir(ns):
-                                if k.startswith("_"):
-                                    continue
-                                try:
-                                    v = getattr(ns, k)
-                                    if v is None or callable(v):
-                                        continue
-                                    data[f"arg.{k}"] = self._serialize_arg_value(v)
-                                except Exception:
-                                    pass
-                        except Exception:
-                            pass
+                        for k in dir(ns):
+                            if k.startswith("_"): continue
+                            try:
+                                v = getattr(ns, k)
+                                if v is None or callable(v): continue
+                                data[f"arg.{k}"] = self._serialize_arg_value(v)
+                            except Exception: pass
                 if interaction.guild:
                     data["guild_id"] = interaction.guild.id
                 if interaction.user:
@@ -411,18 +354,12 @@ class ErrorWatcher:
                 self.breadcrumb("slash_command_start", **data)
             except Exception:
                 pass
-
         try:
             tree.client.add_listener(on_interaction, "on_interaction")
         except Exception:
             pass
 
-    # ─── ATTACH: EVENTS ───────────────────────────────────────
-
     def track_events(self, bot, *event_names):
-        """Add tracking to specific Discord events after bot creation.
-        Example: watcher.track_events(bot, "on_message", "on_reaction_add")
-        """
         if not _DISCORD_OK or not hasattr(bot, "add_listener"):
             return
         for name in event_names:
@@ -445,20 +382,17 @@ class ErrorWatcher:
         if key in self._hooked_events:
             return
         self._hooked_events.add(key)
-
         hook = self._make_event_hook(event_name)
         try:
             bot.add_listener(hook, event_name)
-        except Exception as e:
-            print(f"[ERRWATCH] failed to hook {event_name}: {e}")
+        except Exception:
+            pass
 
     def _make_event_hook(self, event_name: str):
         watcher = self
-
         async def hook(*args, **kwargs):
             try:
-                if not watcher.auto_breadcrumbs:
-                    return
+                if not watcher.auto_breadcrumbs: return
                 data = {}
                 if args:
                     first = args[0]
@@ -467,25 +401,19 @@ class ErrorWatcher:
                             val = getattr(first, attr, None)
                             if val is not None and hasattr(val, "id"):
                                 data[f"{attr}_id"] = val.id
-                        except Exception:
-                            pass
+                        except Exception: pass
                     for attr in ("id", "name", "display_name"):
                         try:
                             val = getattr(first, attr, None)
                             if isinstance(val, (int, str)):
                                 data[attr] = str(val)[:50]
-                        except Exception:
-                            pass
+                        except Exception: pass
                 watcher.breadcrumb(f"event:{event_name}", **data)
             except Exception:
                 pass
-
         return hook
 
-    # ─── DECORATORS ───────────────────────────────────────────
-
     def catch(self, func: Callable):
-        """Wrap an async function so exceptions are reported before re-raising."""
         @functools.wraps(func)
         async def wrapper(*args, **kwargs):
             try:
@@ -500,15 +428,9 @@ class ErrorWatcher:
         return wrapper
 
     def track_task(self, name: str):
-        """Decorator for tasks.loop or plain async functions.
-        Adds task_start, task_error, task_done breadcrumbs.
-        Works in either decorator order (before or after @tasks.loop).
-        """
         def decorator(func):
-            # Case 1: func is a tasks.Loop object (decorator applied AFTER @tasks.loop)
             if hasattr(func, "coro") and hasattr(func, "start"):
                 original_coro = func.coro
-
                 @functools.wraps(original_coro)
                 async def new_coro(*args, **kwargs):
                     self.breadcrumb(f"task_start:{name}")
@@ -519,11 +441,9 @@ class ErrorWatcher:
                         raise
                     finally:
                         self.breadcrumb(f"task_done:{name}")
-
                 func.coro = new_coro
                 return func
 
-            # Case 2: func is a plain async function
             @functools.wraps(func)
             async def wrapper(*args, **kwargs):
                 self.breadcrumb(f"task_start:{name}")
@@ -534,18 +454,11 @@ class ErrorWatcher:
                     raise
                 finally:
                     self.breadcrumb(f"task_done:{name}")
-
             return wrapper
-
         return decorator
 
     @contextlib.asynccontextmanager
     async def track(self, name: str, **context):
-        """Context manager for arbitrary async blocks.
-        Example:
-            async with watcher.track("scan_message", msg_id=message.id):
-                await self.scan_message(message)
-        """
         self.breadcrumb(f"track_start:{name}", **context)
         start = time.time()
         try:
@@ -556,8 +469,6 @@ class ErrorWatcher:
             runtime_ms = int((time.time() - start) * 1000)
             self.breadcrumb(f"track_error:{name}", error=type(e).__name__, runtime_ms=runtime_ms)
             raise
-
-    # ─── SUPPRESS ─────────────────────────────────────────────
 
     @contextlib.asynccontextmanager
     async def suppress(self, *exc_types, report: bool = True, severity: str = "error"):
@@ -570,11 +481,8 @@ class ErrorWatcher:
                     "types": [t.__name__ for t in exc_types],
                 }, severity=severity)
 
-    # ─── EXCEPTHOOK ───────────────────────────────────────────
-
     def install_excepthook(self):
         original = sys.excepthook
-
         def hook(exc_type, exc_value, exc_tb):
             try:
                 self.report_sync(
@@ -582,13 +490,10 @@ class ErrorWatcher:
                     context={"kind": "uncaught", "sys_excepthook": True},
                     severity="critical" if issubclass(exc_type, SystemExit) else "error",
                 )
-            except Exception:
-                pass
+            except Exception: pass
             try:
                 original(exc_type, exc_value, exc_tb)
-            except Exception:
-                pass
-
+            except Exception: pass
         sys.excepthook = hook
 
     def report_sync(self, exc, context: Optional[dict] = None, severity: str = "error"):
@@ -601,30 +506,19 @@ class ErrorWatcher:
             except Exception as e:
                 print(f"[ERRWATCH] report_sync failed: {e}")
 
-    # ─── AUTO BREADCRUMB: COMMAND HOOKS ───────────────────────
-
     def _serialize_arg_value(self, arg) -> str:
         try:
-            if arg is None:
-                return "None"
-            if isinstance(arg, bool):
-                return str(arg)
-            if isinstance(arg, (int, float)):
-                return str(arg)
-            if isinstance(arg, str):
-                return arg[:100] + ("…" if len(arg) > 100 else "")
+            if arg is None: return "None"
+            if isinstance(arg, bool): return str(arg)
+            if isinstance(arg, (int, float)): return str(arg)
+            if isinstance(arg, str): return arg[:100] + ("…" if len(arg) > 100 else "")
             if isinstance(arg, (list, tuple)):
-                if len(arg) > 3:
-                    return f"[{len(arg)} items]"
+                if len(arg) > 3: return f"[{len(arg)} items]"
                 return "[" + ",".join(self._serialize_arg_value(a) for a in arg) + "]"
-            if isinstance(arg, dict):
-                return f"{{{len(arg)} keys}}"
-            if hasattr(arg, "filename"):
-                return f"Attachment({arg.filename})"
-            if hasattr(arg, "id") and hasattr(arg, "name"):
-                return f"{arg.__class__.__name__}({arg.name}, {arg.id})"
-            if hasattr(arg, "id"):
-                return f"{arg.__class__.__name__}({arg.id})"
+            if isinstance(arg, dict): return f"{{{len(arg)} keys}}"
+            if hasattr(arg, "filename"): return f"Attachment({arg.filename})"
+            if hasattr(arg, "id") and hasattr(arg, "name"): return f"{arg.__class__.__name__}({arg.name}, {arg.id})"
+            if hasattr(arg, "id"): return f"{arg.__class__.__name__}({arg.id})"
             return f"<{type(arg).__name__}>"
         except Exception:
             return "<?>"
@@ -651,9 +545,7 @@ class ErrorWatcher:
 
     async def _on_command(self, ctx):
         try:
-            if not ctx.command:
-                return
-            if ctx.command.qualified_name in self.silent_commands:
+            if not ctx.command or ctx.command.qualified_name in self.silent_commands:
                 return
             now = time.time()
             self._gc_command_timings(now)
@@ -665,10 +557,8 @@ class ErrorWatcher:
             if self.breadcrumb_include_args:
                 for k, v in self._extract_command_args(ctx).items():
                     data[f"arg.{k}"] = v
-            if ctx.guild:
-                data["guild_id"] = ctx.guild.id
-            if ctx.author:
-                data["user_id"] = ctx.author.id
+            if ctx.guild: data["guild_id"] = ctx.guild.id
+            if ctx.author: data["user_id"] = ctx.author.id
             if self.breadcrumb_include_attachments and ctx.message.attachments:
                 atts = [f"{a.filename}({a.size}B)" for a in ctx.message.attachments[:3]]
                 data["attachments"] = ",".join(atts)
@@ -678,9 +568,7 @@ class ErrorWatcher:
 
     async def _on_command_completion(self, ctx):
         try:
-            if not ctx.command:
-                return
-            if ctx.command.qualified_name in self.silent_commands:
+            if not ctx.command or ctx.command.qualified_name in self.silent_commands:
                 return
             start = self._command_timings.pop(ctx.message.id, None)
             data = {"cmd": ctx.command.qualified_name}
@@ -692,11 +580,7 @@ class ErrorWatcher:
 
     def _gc_command_timings(self, now: float):
         cutoff = now - 3600
-        self._command_timings = {
-            k: v for k, v in self._command_timings.items() if v >= cutoff
-        }
-
-    # ─── COMMAND ERROR HANDLER ────────────────────────────────
+        self._command_timings = {k: v for k, v in self._command_timings.items() if v >= cutoff}
 
     async def _handle_command_error(self, ctx, error):
         from discord.ext import commands
@@ -708,17 +592,13 @@ class ErrorWatcher:
             "command": getattr(ctx.command, "qualified_name", str(ctx.command)),
         }
         try:
-            if ctx.guild:
-                context["guild"] = f"{ctx.guild.name} ({ctx.guild.id})"
-            if ctx.author:
-                context["user"] = f"{ctx.author} ({ctx.author.id})"
-            if ctx.channel:
-                context["channel"] = f"#{getattr(ctx.channel, 'name', ctx.channel.id)}"
+            if ctx.guild: context["guild"] = f"{ctx.guild.name} ({ctx.guild.id})"
+            if ctx.author: context["user"] = f"{ctx.author} ({ctx.author.id})"
+            if ctx.channel: context["channel"] = f"#{getattr(ctx.channel, 'name', ctx.channel.id)}"
             context["message"] = (ctx.message.content or "")[:200]
         except Exception:
             pass
 
-        # Add command_error breadcrumb
         if self.auto_breadcrumbs and ctx.command:
             try:
                 start = self._command_timings.pop(ctx.message.id, None)
@@ -732,11 +612,9 @@ class ErrorWatcher:
         await self.report(error, context=context)
 
         try:
-            await ctx.send(f"❌ `{type(error).__name__}` — logged for owner.")
+            await ctx.send(f"{self._em('reply_error')}`{type(error).__name__}` — logged for owner.")
         except Exception:
             pass
-
-    # ─── ENV / CONFIG ─────────────────────────────────────────
 
     def _env_snapshot(self) -> dict:
         mem = "?"
@@ -775,10 +653,16 @@ class ErrorWatcher:
 
     def _env_summary(self) -> str:
         e = self._env_snapshot()
-        return (
-            f"Py {e['py']} · {e['os']} · discord {e['discord']} · "
-            f"up {e['uptime']} · {e['mem']}"
-        )
+        return f"Py {e['py']} · {e['os']} · discord {e['discord']} · up {e['uptime']} · {e['mem']}"
+
+    def _em(self, key: str) -> str:
+        if not self.use_emojis: return ""
+        if key in self.emojis:
+            emoji = self.emojis[key]
+        else:
+            emoji = _EMOJI_DEFAULTS.get(key, "")
+        if not emoji: return ""
+        return f"{emoji} "
 
     def _get_config_snapshot(self) -> dict:
         if self.config_provider is None:
@@ -797,8 +681,6 @@ class ErrorWatcher:
         except Exception:
             return {}
 
-    # ─── FILTERS ──────────────────────────────────────────────
-
     def _should_ignore(self, exc) -> bool:
         tname = f"{type(exc).__module__}.{type(exc).__name__}"
         short = type(exc).__name__
@@ -812,17 +694,13 @@ class ErrorWatcher:
         return False
 
     def _should_sample(self) -> bool:
-        if self.sample_rate >= 1.0:
-            return True
-        if self.sample_rate <= 0.0:
-            return False
+        if self.sample_rate >= 1.0: return True
+        if self.sample_rate <= 0.0: return False
         return random.random() < self.sample_rate
 
     def _is_new_fingerprint(self, fp: str) -> bool:
-        if fp in self._seen_fingerprints:
-            return False
-        if len(self._seen_fingerprints) >= self._max_fingerprints:
-            return False
+        if fp in self._seen_fingerprints: return False
+        if len(self._seen_fingerprints) >= self._max_fingerprints: return False
         self._seen_fingerprints.add(fp)
         return True
 
@@ -830,8 +708,6 @@ class ErrorWatcher:
         tname = type(exc).__name__
         full = f"{type(exc).__module__}.{tname}"
         return _RECOVERY_SUGGESTIONS.get(full) or _RECOVERY_SUGGESTIONS.get(tname, "")
-
-    # ─── HOURLY / STATS ───────────────────────────────────────
 
     def _hourly_update(self, fp: str) -> tuple[int, bool, bool]:
         now = time.time()
@@ -853,14 +729,10 @@ class ErrorWatcher:
 
     def _gc_hourly(self, now: float):
         cutoff = now - 7200
-        self._hourly = {
-            k: v for k, v in self._hourly.items()
-            if v["reset_at"] > cutoff or v.get("muted_until", 0) > now
-        }
+        self._hourly = {k: v for k, v in self._hourly.items() if v["reset_at"] > cutoff or v.get("muted_until", 0) > now}
 
     def _track_command(self, command: str):
-        if not command:
-            return
+        if not command: return
         now = time.time()
         s = self._command_stats.setdefault(command, {"total": 0, "hourly": deque(maxlen=100)})
         s["total"] += 1
@@ -871,19 +743,14 @@ class ErrorWatcher:
 
     def _command_stats_for(self, command: str) -> dict:
         s = self._command_stats.get(command)
-        if not s:
-            return {}
+        if not s: return {}
         return {"total": s["total"], "hourly": len(s["hourly"])}
-
-    # ─── REPORT ───────────────────────────────────────────────
 
     async def report(self, exc: BaseException, context: Optional[dict] = None, severity: str = "error"):
         try:
             context = context or {}
-            if self._should_ignore(exc):
-                return
-            if not self._should_sample():
-                return
+            if self._should_ignore(exc): return
+            if not self._should_sample(): return
 
             tb_full = "".join(tb_module.format_exception(type(exc), exc, exc.__traceback__))
             fp_src = f"{type(exc).__name__}|{str(exc)[:200]}|{tb_full[-300:]}"
@@ -902,84 +769,59 @@ class ErrorWatcher:
                     entry = self._dedup[fp]
                     is_duplicate = False
                 cmd = context.get("command")
-                if cmd:
-                    self._dedup[fp]["commands"].add(cmd)
+                if cmd: self._dedup[fp]["commands"].add(cmd)
                 cutoff = now - self.dedup_window * 4
                 self._dedup = {k: v for k, v in self._dedup.items() if v["first"] >= cutoff}
 
             cmd = context.get("command")
-            if cmd:
-                self._track_command(cmd)
+            if cmd: self._track_command(cmd)
 
             hourly_count, muted, just_muted = self._hourly_update(fp)
             self._write_log(exc, tb_full, context, fp, hourly_count)
 
-            if muted and not just_muted:
-                return
+            if muted and not just_muted: return
             if is_duplicate and entry["count"] not in (2, 5, 10, 25, 100):
-                if not just_muted:
-                    return
+                if not just_muted: return
 
             recent = [t for t in self._recent_sends if now - t < 3600]
             self._recent_sends = deque(recent, maxlen=200)
             if len(recent) >= self.rate_limit and not just_muted:
-                print(f"[ERRWATCH] rate limit — skipping delivery for {type(exc).__name__}")
                 return
             self._recent_sends.append(now)
 
             dedup_count = entry["count"] if is_duplicate else 1
-            extra_note = (
-                f"AUTO-MUTED {self.mute_duration // 3600}h after {hourly_count} hits/hr"
-                if just_muted else ""
-            )
+            extra_note = f"AUTO-MUTED {self.mute_duration // 3600}h after {hourly_count} hits/hr" if just_muted else ""
 
             if self.test_mode:
                 print(f"[ERRWATCH] test_mode — would deliver: {type(exc).__name__}: {exc}")
                 return
 
             if self.collector_url:
-                await self._post_collector(
-                    exc, tb_full, context, severity, dedup_count, fp, hourly_count, is_new,
-                )
+                await self._post_collector(exc, tb_full, context, severity, dedup_count, fp, hourly_count, is_new)
             if self.webhook_url:
-                await self._post_webhook(
-                    exc, tb_full, context, fp, dedup_count, severity,
-                    hourly_count=hourly_count, extra_note=extra_note,
-                    is_new=is_new, commands=entry.get("commands", set()),
-                )
+                await self._post_webhook(exc, tb_full, context, fp, dedup_count, severity, hourly_count, extra_note, is_new, entry.get("commands", set()))
             if isinstance(exc, CriticalError):
                 await self._dm_owner(exc, tb_full, context)
 
         except Exception as internal:
             try:
                 with open(self.log_file, "a", encoding="utf-8") as f:
-                    f.write(f"\n[{datetime.now(timezone.utc).isoformat()}] "
-                            f"ERRWATCH INTERNAL: {internal}\n")
+                    f.write(f"\n[{datetime.now(timezone.utc).isoformat()}] ERRWATCH INTERNAL: {internal}\n")
                     f.write(tb_module.format_exc())
             except Exception:
                 pass
 
-    # ─── WEBHOOK ──────────────────────────────────────────────
-
-    async def _post_webhook(
-        self, exc, tb_full, context, fp, count, severity,
-        hourly_count: int = 0, extra_note: str = "",
-        is_new: bool = False, commands: Optional[set] = None,
-    ):
-        if not self.webhook_url:
-            return
+    async def _post_webhook(self, exc, tb_full, context, fp, count, severity, hourly_count=0, extra_note="", is_new=False, commands=None):
+        if not self.webhook_url: return
         sev   = severity if severity in _SEV_COLOR else "error"
-        emoji = _SEV_EMOJI[sev]
         color = _SEV_COLOR[sev]
 
         filtered = _filter_traceback(exc, self.project_dirs)
         filtered_text = "\n".join(filtered)
 
-        title = f"{emoji} {type(exc).__name__}"
-        if is_new:
-            title = f"[NEW] {title}"
-        if extra_note:
-            title = f"{title}  ⚠ {extra_note}"
+        title = f"{self._em(sev)}{type(exc).__name__}"
+        if is_new: title = f"{self._em('new')}{title}"
+        if extra_note: title = f"{title}  {self._em('warning')}{extra_note}"
 
         if len(filtered_text) <= 1700:
             desc = f"```python\n{filtered_text}\n```"
@@ -996,53 +838,31 @@ class ErrorWatcher:
         }
 
         if self.show_env:
-            embed["fields"].append({
-                "name":   "Environment",
-                "value":  f"`{self._env_summary()}`"[:1024],
-                "inline": False,
-            })
+            embed["fields"].append({"name": f"{self._em('env')}Environment", "value": f"`{self._env_summary()}`"[:1024], "inline": False})
 
         cfg = self._get_config_snapshot()
         if cfg:
             cfg_text = "  ·  ".join(f"`{k}`={v}" for k, v in list(cfg.items())[:8])
-            embed["fields"].append({
-                "name": "Config", "value": cfg_text[:1024], "inline": False,
-            })
+            embed["fields"].append({"name": f"{self._em('config')}Config", "value": cfg_text[:1024], "inline": False})
 
         if count > 1:
-            embed["fields"].append({
-                "name": "Window",
-                "value": f"×{count} in last {self.dedup_window // 60}m",
-                "inline": True,
-            })
+            embed["fields"].append({"name": "Window", "value": f"×{count} in last {self.dedup_window // 60}m", "inline": True})
         if hourly_count > 1:
-            embed["fields"].append({
-                "name": "Hourly", "value": f"×{hourly_count}/hr", "inline": True,
-            })
+            embed["fields"].append({"name": "Hourly", "value": f"×{hourly_count}/hr", "inline": True})
 
         if commands and len(commands) > 1:
-            embed["fields"].append({
-                "name":   "Commands hit",
-                "value":  "`" + "` · `".join(sorted(commands))[:500] + "`",
-                "inline": False,
-            })
+            embed["fields"].append({"name": "Commands hit", "value": "`" + "` · `".join(sorted(commands))[:500] + "`", "inline": False})
 
         cmd = context.get("command")
         if self.show_stats and cmd:
             stats = self._command_stats_for(cmd)
             if stats:
-                embed["fields"].append({
-                    "name":   "Command stats",
-                    "value":  f"total `{stats['total']}` · last hour `{stats['hourly']}`",
-                    "inline": True,
-                })
+                embed["fields"].append({"name": f"{self._em('stats')}Command stats", "value": f"total `{stats['total']}` · last hour `{stats['hourly']}`", "inline": True})
 
         if self.show_suggestions:
             suggestion = self._suggest_fix(exc)
             if suggestion:
-                embed["fields"].append({
-                    "name": "💡 Suggested fix", "value": suggestion[:1024], "inline": False,
-                })
+                embed["fields"].append({"name": f"{self._em('fix')}Suggested fix", "value": suggestion[:1024], "inline": False})
 
         crumbs = self._breadcrumbs.snapshot(self._breadcrumb_show)
         if crumbs:
@@ -1051,9 +871,7 @@ class ErrorWatcher:
                 t = datetime.fromtimestamp(c["t"], timezone.utc).strftime("%H:%M:%S")
                 data_str = "  ".join(f"{k}={v}" for k, v in c["data"].items())[:160]
                 crumb_lines.append(f"`{t}` · {c['event']}" + (f" · {data_str}" if data_str else ""))
-            embed["fields"].append({
-                "name": "🍞 Breadcrumbs", "value": "\n".join(crumb_lines)[:1024], "inline": False,
-            })
+            embed["fields"].append({"name": f"{self._em('bread')}Breadcrumbs", "value": "\n".join(crumb_lines)[:1024], "inline": False})
 
         label_map = {
             "kind": "Kind", "command": "Command", "guild": "Guild",
@@ -1062,13 +880,10 @@ class ErrorWatcher:
         }
         for key, label in label_map.items():
             if key in context:
-                if len(embed["fields"]) >= 25:
-                    break
-                embed["fields"].append({
-                    "name": label, "value": f"`{str(context[key])[:500]}`", "inline": True,
-                })
+                if len(embed["fields"]) >= 25: break
+                embed["fields"].append({"name": label, "value": f"`{str(context[key])[:500]}`", "inline": True})
 
-        files: list[dict] = []
+        files = []
         if len(filtered_text) > 1500:
             files.append({"name": f"{type(exc).__name__}-filtered.txt", "content": filtered_text.encode()})
         if len(tb_full) > 1500:
@@ -1082,33 +897,21 @@ class ErrorWatcher:
             for i, f in enumerate(files):
                 form.add_field(f"files[{i}]", f["content"], filename=f["name"], content_type="text/plain")
 
-            async with self._session.post(
-                self.webhook_url, data=form,
-                timeout=aiohttp.ClientTimeout(total=15),
-            ) as r:
+            async with self._session.post(self.webhook_url, data=form, timeout=aiohttp.ClientTimeout(total=15)) as r:
                 if r.status == 429:
-                    try:
-                        data = await r.json()
-                    except Exception:
-                        data = {}
+                    try: data = await r.json()
+                    except Exception: data = {}
                     wait = float(data.get("retry_after", 2))
                     await asyncio.sleep(wait + 1)
-                    await self._post_webhook(
-                        exc, tb_full, context, fp, count, severity,
-                        hourly_count=hourly_count, extra_note=extra_note,
-                        is_new=is_new, commands=commands,
-                    )
+                    await self._post_webhook(exc, tb_full, context, fp, count, severity, hourly_count, extra_note, is_new, commands)
                 elif r.status not in (200, 204):
                     text = await r.text()
                     print(f"[ERRWATCH] webhook HTTP {r.status}: {text[:200]}")
         except Exception as e:
             print(f"[ERRWATCH] webhook send failed: {type(e).__name__}: {e}")
 
-    # ─── COLLECTOR ────────────────────────────────────────────
-
     async def _post_collector(self, exc, tb_full, context, severity, count, fp, hourly_count, is_new):
-        if not self.collector_url:
-            return
+        if not self.collector_url: return
         try:
             if self._session is None or self._session.closed:
                 self._session = aiohttp.ClientSession()
@@ -1116,44 +919,30 @@ class ErrorWatcher:
             if self.collector_secret:
                 headers["X-Errwatch-Token"] = self.collector_secret
             payload = {
-                "bot_name":      self.bot_name,
-                "severity":      severity,
-                "error_type":    type(exc).__name__,
-                "error_message": str(exc)[:1000],
-                "traceback":     tb_full[:8000],
-                "context":       {**context, "_env": self._env_snapshot(), "_config": self._get_config_snapshot()},
-                "fingerprint":   fp,
-                "count":         count,
-                "hourly_count":  hourly_count,
-                "is_new":        is_new,
-                "breadcrumbs":   self._breadcrumbs.snapshot(self._breadcrumb_show),
+                "bot_name": self.bot_name, "severity": severity, "error_type": type(exc).__name__,
+                "error_message": str(exc)[:1000], "traceback": tb_full[:8000],
+                "context": {**context, "_env": self._env_snapshot(), "_config": self._get_config_snapshot()},
+                "fingerprint": fp, "count": count, "hourly_count": hourly_count, "is_new": is_new,
+                "breadcrumbs": self._breadcrumbs.snapshot(self._breadcrumb_show),
             }
-            async with self._session.post(
-                f"{self.collector_url}/report",
-                headers=headers, json=payload,
-                timeout=aiohttp.ClientTimeout(total=8),
-            ) as r:
+            async with self._session.post(f"{self.collector_url}/report", headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=8)) as r:
                 if r.status not in (200, 201):
                     text = await r.text()
                     print(f"[ERRWATCH] collector HTTP {r.status}: {text[:200]}")
         except Exception as e:
             print(f"[ERRWATCH] collector send failed: {type(e).__name__}: {e}")
 
-    # ─── OWNER DM ─────────────────────────────────────────────
-
     async def _dm_owner(self, exc, tb_full, context):
-        if not _DISCORD_OK or not self.owner_id or not self._bot:
-            return
+        if not _DISCORD_OK or not self.owner_id or not self._bot: return
         try:
             import discord
             owner = self._bot.get_user(self.owner_id)
             if owner is None:
                 owner = await self._bot.fetch_user(self.owner_id)
-            if owner is None:
-                return
+            if owner is None: return
             filtered_text = "\n".join(_filter_traceback(exc, self.project_dirs))
             embed = discord.Embed(
-                title=f"🚨 CRITICAL: {type(exc).__name__}"[:256],
+                title=f"{self._em('critical')}CRITICAL: {type(exc).__name__}"[:256],
                 description=f"```python\n{filtered_text[-1800:]}\n```"[:4000],
                 color=0xFF0000,
                 timestamp=datetime.now(timezone.utc),
@@ -1165,22 +954,15 @@ class ErrorWatcher:
         except Exception as e:
             print(f"[ERRWATCH] DM owner failed: {type(e).__name__}: {e}")
 
-    # ─── FILE LOG + ROTATION ──────────────────────────────────
-
     def _write_log(self, exc, tb_full, context, fp, hourly_count):
-        if not self.log_file:
-            return
+        if not self.log_file: return
         try:
             if self.log_max_bytes > 0 and os.path.exists(self.log_file):
-                try:
-                    if os.path.getsize(self.log_file) > self.log_max_bytes:
-                        self._rotate_log()
-                except Exception:
-                    pass
+                if os.path.getsize(self.log_file) > self.log_max_bytes:
+                    self._rotate_log()
             with open(self.log_file, "a", encoding="utf-8") as f:
                 f.write(f"\n{'=' * 70}\n")
-                f.write(f"[{datetime.now(timezone.utc).isoformat()}] "
-                        f"{type(exc).__name__}: {exc}\n")
+                f.write(f"[{datetime.now(timezone.utc).isoformat()}] {type(exc).__name__}: {exc}\n")
                 f.write(f"  fp: {fp}  hourly: {hourly_count}  env: {self._env_summary()}\n")
                 for k, v in context.items():
                     f.write(f"  {k}: {v}\n")
@@ -1193,13 +975,10 @@ class ErrorWatcher:
             for i in range(self.log_backup_count - 1, 0, -1):
                 src = f"{self.log_file}.{i}"
                 dst = f"{self.log_file}.{i + 1}"
-                if os.path.exists(src):
-                    os.replace(src, dst)
+                if os.path.exists(src): os.replace(src, dst)
             os.replace(self.log_file, f"{self.log_file}.1")
         except Exception:
             pass
-
-    # ─── SHUTDOWN ─────────────────────────────────────────────
 
     async def shutdown(self, timeout: float = 2.0):
         try:
@@ -1210,8 +989,6 @@ class ErrorWatcher:
 
     async def close(self):
         if self._session and not self._session.closed:
-            try:
-                await self._session.close()
-            except Exception:
-                pass
+            try: await self._session.close()
+            except Exception: pass
             self._session = None
